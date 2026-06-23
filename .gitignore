@@ -1,0 +1,2 @@
+# no secrets or backups in this repo (docs only)
+*.env
