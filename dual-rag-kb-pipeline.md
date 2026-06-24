@@ -8,6 +8,7 @@
 - **Date:** 2026-06-23
 - **Status:** PUBLISHED / live — `activeVersionId` = `<ACTIVE_VERSION_ID>`
 - **Node count:** 59 → **56** after rework + simplification + per-file collapse
+- **Companion cleanup fix:** 2026-06-24 — namespace-wipe bug found & fixed in the separate `KB Orphan Vector Cleanup` workflow (see §12); this was the actual cause of `company_docs` losing all its vectors.
 
 ---
 
@@ -131,6 +132,7 @@ Key state stores:
 - Google Sheets **read/lookup** nodes also break paired-item linkage — use a `Merge` (enrich) to bring looked-up values onto the working item instead of cross-node `.item` references.
 - Pinecone **serverless**: delete-by-metadata is capped at **5/sec per namespace**; `$ne` filters skip vectors lacking the field.
 - Always ask the rollout method before editing a workflow, and checkpoint the full JSON first.
+- **Orphan/GC cleanup is dangerous:** a Pinecone delete-by-metadata built from a dynamic "keep" list will wipe the **entire namespace** if that list is ever empty — `$nin: []` (and `$in: []`) match **every** vector. Always guard `ids.length === 0` and **abort before deleting**. A wrong folder ID (querying the Sheet doc instead of the Drive folder) is exactly how the companion `KB Orphan Vector Cleanup` returned 0 files and nuked `company_docs` nightly — see §12.
 
 ---
 
@@ -195,6 +197,7 @@ General diagnosis: open the failed **execution**, click the red/failed node, rea
 | **All of a file's chunks tagged with the WRONG `drive_file_id`** (multi-file run) | langchain Insert collapses `pairedItem` to 0 → loader metadata + downstream resolve to file 0. | Inspect `Insert KB Vectors` output items → `metadata.drive_file_id`; if 2 different files show the same id, this is it. | Loop Over Items (batchSize 1) + reference `$('Loop Over Items').first()` everywhere per-file. |
 | **Files silently skipped / KB ends up empty** | `KBState` out of sync with Pinecone (state says "indexed" but vectors were wiped). | `Content Changed?` goes false though Pinecone has no vectors for that file. | Whenever you `deleteAll` the namespace, also clear `KBState`. Keep them in sync. |
 | **Vectors deleted but never come back** (the original bug) | Destructive delete-then-reinsert; re-insert failed or raced. | Old design only — confirm `Purge Stale Vectors` is gone and purge runs only AFTER insert. | Insert-then-purge-by-hash (already in place). |
+| **Entire `company_docs` namespace wiped (recurring / nightly)** | The **separate** `KB Orphan Vector Cleanup` workflow built its delete filter from an **empty** Drive listing → `$nin:[]` matches every vector. The listing was querying the **Sheet doc ID instead of the Drive folder ID**, so it returned 0 files. | In that workflow's executions: `List Drive Folder Files` → `files:[]`, `Build Orphan Filter` → `"$nin":[]`, `Delete Orphan Vectors` → `success`. The run shows `error` only from a *later* log node, masking the delete. | Point the listing at the real `<DRIVE_FOLDER_ID>`; add an `ids.length === 0` abort guard. See §12. |
 | **HTTP node: credential can't be set / "does not accept credential 'pineconeApi'"** | n8n MCP/import can't bind predefined-type creds to `httpRequest`. | Node shows no credential after import/programmatic edit. | Attach the Pinecone credential manually in the editor on `Delete Old Vectors` and `Purge Prior Version`; then publish. |
 | **`Lookup KB State` errors** (sheet/tab not found) | `KBState` tab doesn't exist yet. | Read node error references the sheet/range. | Create the `KBState` tab (`file_id\|stored_token\|updated_at`). |
 | **Google Docs (native) file fails in pipeline** | `Download File` does a raw download; native Google Docs require an export format. | Error on `Download File` for a `application/vnd.google-apps.document`. | Add an export step for the `gdoc` route, or remove that route if KB is only PDF/DOCX/TXT. |
@@ -262,3 +265,31 @@ Customer Query Webhook (POST /<WEBHOOK_PATH>, responseMode = responseNode)
 - **`Alert Staff on Slack` currently has the pre-existing validation warning** (missing `resource`/`operation` discriminator) — set `resource=message`, `operation=post` when configuring.
 - The agent answers strictly from retrieval; if `company_docs` is empty (e.g. mid-reindex), expect low-confidence/escalation responses — not hallucinated answers (by design).
 - Self-learned writes are ungated by content hash; over time `self_learned` can accumulate near-duplicate Q&A. Prune periodically if it grows noisy.
+
+---
+
+## 12. Companion workflow — KB Orphan Vector Cleanup (namespace-wipe bug, fixed 2026-06-24)
+
+A **separate** scheduled workflow, **`KB Orphan Vector Cleanup`** (`<CLEANUP_WORKFLOW_ID>`), runs nightly at 2 AM to garbage-collect vectors for files removed from Drive *without* a `DELETE_` rename. It is independent of the main pipeline and shares only the Pinecone index/namespace. **This — not the main pipeline — was the real cause of `company_docs` losing its vectors.** The main pipeline's insert-then-purge logic was verified correct and never over-deleted.
+
+### The bug
+The cleanup deletes every vector whose `drive_file_id` is **not** in the current Drive folder listing. Two faults combined to wipe the whole namespace every night:
+
+1. **Wrong folder ID.** `List Drive Folder Files` queried `'<SHEETS_DOC_ID>' in parents` — the **Google Sheet** doc ID, not the **Drive KB folder** (`<DRIVE_FOLDER_ID>`). A spreadsheet has no child files, so the listing returned **0 files every run**.
+2. **Unguarded `$nin: []`.** With an empty ID list, `Build Orphan Filter` produced `{ drive_file_id: { "$nin": [] } }`. In Pinecone an empty `$nin` matches **every** vector, so `Delete Orphan Vectors` purged all of `company_docs`.
+
+**Why it stayed hidden:** the delete node has `onError: continueRegularOutput`, and each run only showed status `error` because the *downstream* `Log Cleanup to Sheets` node failed on a `YOUR_SPREADSHEET_ID` placeholder — **after** the delete had already succeeded. Confirmed from execution data: `files:[]` → `"$nin":[]` → delete `success`. It had been wiping the namespace nightly since 2026-06-20.
+
+### The fix (3 changes; backup `<CLEANUP_WORKFLOW_ID>_2026-06-24.json`)
+1. **Correct folder ID** — query now targets `'<DRIVE_FOLDER_ID>' in parents and trashed=false`.
+2. **Empty-list guard (the real safeguard)** — `Build Orphan Filter` now `throw`s and aborts if `ids.length === 0`, so a wrong folder / API hiccup / empty folder can **never** wipe the namespace again. No delete is ever sent on an empty keep-list.
+3. **Log fix** — `Log Cleanup to Sheets` document ID set to the real `<SHEETS_DOC_ID>`.
+
+### Status / rollout
+- Fix is **saved to the draft but NOT yet published**; the workflow is **deactivated** as a stopgap so it cannot fire again until the KB is restored.
+- **Recovery before re-publishing:** (1) confirm `company_docs` is empty in Pinecone (or `deleteAll`); (2) clear `KBState` data rows; (3) re-upload the current KB files to Drive so ingestion repopulates; (4) reconcile **Drive count = distinct `KBState.file_id` = distinct Pinecone `drive_file_id`**; (5) **then publish** the cleanup to re-arm the nightly sweep.
+
+### Notes
+- The `DELETE_` path (`Delete Old Vectors`) and the nightly sweep are **complementary**, not redundant: `DELETE_` is immediate; the sweep is the catch-all for files deleted straight from Drive (≤24h lag). Both retained.
+- The KB folder contents changed during debugging (the FIA F1 regulation PDFs were swapped for other PDFs); "what belongs in `company_docs`" is whatever is currently in `<DRIVE_FOLDER_ID>`.
+- The `Logs` tab is heavily bloated with per-chunk duplicate rows from pre-fix runs — cosmetic; de-dupe (`Remove duplicates`) is optional. Leave `Logs` append-only otherwise.
