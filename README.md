@@ -25,3 +25,4 @@ Design notes, build runbook, and troubleshooting guide for an n8n workflow that:
 - The langchain vector-store **Insert node collapses `pairedItem` to 0** and emits **one item per chunk** — isolate per-file work in a `Loop Over Items` (batch 1) + a `Limit` node, and reference `$('Loop Over Items').first()`.
 - Google Sheets **read/lookup** breaks paired-item linkage — use a `Merge` (enrich) instead of cross-node `.item`.
 - Pinecone **serverless** caps delete-by-metadata at **5/sec per namespace**; `$ne` filters skip vectors missing the field.
+- **Model routing, live:** the query agent runs on Azure OpenAI (`gpt-5-mini`), swapped in 2026-09-03 after the original Gemini free tier hit its 20 req/day cap. The Gemini node stays in the workflow, disabled, as the rollback path rather than deleted — see §4.8 in the full write-up.
