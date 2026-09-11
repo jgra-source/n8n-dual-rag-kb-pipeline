@@ -5,9 +5,10 @@
 - **Instance:** https://<N8N_INSTANCE>
 - **Pinecone index:** `<PINECONE_INDEX>` (serverless, host `<PINECONE_HOST>`), namespace `company_docs`
 - **Embeddings:** Google Vertex `text-embedding-005` (768-dim), project `<VERTEX_PROJECT>`
-- **Date:** 2026-06-23
+- **Date:** 2026-06-23 (rework); **last verified live 2026-09-11**
 - **Status:** PUBLISHED / live — `activeVersionId` = `<ACTIVE_VERSION_ID>`
-- **Node count:** 59 → **56** after rework + simplification + per-file collapse
+- **Node count:** 59 → 56 after rework + simplification + per-file collapse → **57** after the 2026-09-03 model-provider addition (§4.8)
+- **Agent model (live, 2026-09-11):** Azure OpenAI `gpt-5-mini` — swapped from Gemini 2.5 Flash free tier on 2026-09-03; see §4.8
 - **Companion cleanup fix:** 2026-06-24 — namespace-wipe bug found & fixed in the separate `KB Orphan Vector Cleanup` workflow (see §12); this was the actual cause of `company_docs` losing all its vectors.
 
 ---
@@ -88,6 +89,7 @@ Key state stores:
 5. **Simplification (59 → 54)** — collapsed 3× `Purge Prior Version` → 1, 3× `Log Upsert` → 1 (action `"upsert"`), removed dead `Delete Complete` Set node.
 6. **Paired-item fix #2 (the big one)** — the langchain `Insert KB Vectors` node **collapses `pairedItem` to 0**, so in multi-file runs every post-insert reference (`Purge`, `Log`, `Update KB State`) AND the loader metadata resolved to the *first* file → all chunks mis-tagged with file 0's `drive_file_id`/`content_token`. **Fixed** by wrapping the per-file body in **`Loop Over Items` (batchSize 1)** and repointing every per-file reference to `$('Loop Over Items').first()` (pairing-independent, since one item per iteration). This makes ingestion serial (slower) but correct.
 7. **Per-chunk fan-out fix** — the langchain `Insert` node emits **one output item per chunk**, so the tail (`Purge → Log → Update KB State`) was running once *per chunk* instead of once per file. Symptoms: dozens of duplicate `KBState`/`Logs` rows per file, and the purge firing N delete-by-metadata calls per file (the real cause of the earlier 5/sec rate-limit error at "item 39"). **Fixed** by inserting a **`One Per File`** node (`Limit`, maxItems 1) between the inserts and the tail, so each file produces exactly one purge call, one log row, one KBState upsert.
+8. **Model-provider swap (2026-09-03)** — the query-side agent originally ran on `gemini-2.5-pro`/`flash` via the Google Vertex chat node (`Agent Model`). Gemini's free tier caps at **20 requests/day**, which the live support agent exceeded. Added `Agent Model (Azure)` (`lmChatAzureOpenAi`, `gpt-5-mini`) and repointed `Support Agent`'s `ai_languageModel` connection to it. **The Gemini node was not deleted** — it's disabled in place, connection removed, kept as the documented rollback path if the Azure deployment is ever unavailable. Retrieval and embeddings (Vertex `text-embedding-005`) were untouched — only the agent's own reasoning model moved; the two retriever embeddings still must match the ingestion embeddings, which they do (§9.5 invariant unaffected).
 
 ---
 
@@ -220,7 +222,7 @@ The query side is independent of the KB ingestion side (shares only the Pinecone
 | Placeholder | This env | Used in |
 |---|---|---|
 | `<WEBHOOK_PATH>` | `support-agent` | `Customer Query Webhook` (POST) |
-| `<AGENT_MODEL>` | `gemini-2.5-pro` (temp 0.2) | `Agent Model` |
+| `<AGENT_MODEL>` | live: `gpt-5-mini` via Azure OpenAI (`lmChatAzureOpenAi`); rollback: `gemini-2.5-flash` (temp 0.2) via Google Vertex, kept disabled — see §4.8 | `Agent Model (Azure)` (wired) / `Agent Model` (disabled) |
 | `<SELF_LEARNED_NS>` | `self_learned` | `Self-Learned Answers KB`, `Write to Self-Learned KB` |
 | `<CONFIDENCE_THRESHOLD>` | `0.78` | `Config` (`cfg_confidenceThreshold`), `Confident Enough to Learn?` |
 | `<MODE>` | `live` | `Config` (`cfg_mode`) — gates whether Slack alerts actually send |
@@ -233,7 +235,7 @@ Customer Query Webhook (POST /<WEBHOOK_PATH>, responseMode = responseNode)
   → Message Empty?  (IF $json.message is empty)
        ├─ true  → Reject Empty Message (respondToWebhook 400)
        └─ false → Support Agent
-                    ├─ ai_languageModel: Agent Model (lmChatGoogleVertex, gemini-2.5-pro, temp 0.2)
+                    ├─ ai_languageModel: Agent Model (Azure) (lmChatAzureOpenAi, gpt-5-mini) — swapped in from Agent Model (lmChatGoogleVertex, gemini-2.5-flash), disabled, §4.8
                     ├─ ai_tool:          Company Docs KB (vectorStorePinecone retrieve-as-tool, ns company_docs, topK 6)
                     │                      └ ai_embedding: Embeddings Docs Retriever (embeddingsGoogleVertex)
                     ├─ ai_tool:          Self-Learned Answers KB (retrieve-as-tool, ns self_learned)
